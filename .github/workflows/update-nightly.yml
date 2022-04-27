@@ -1,0 +1,208 @@
+# General CI Template for various situation
+# **** Review All "XXX" Before Use ****
+# Author: Misty
+
+# need to enable Write permission in "Workflow permissions" of repo settings
+
+name: libimobiledevice Nightly Packaging CI
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
+        required: false
+        default: false
+  repository_dispatch:
+  schedule:
+   - cron: "0 */4 * * *" # min hour day week year
+
+env:
+  VERSION_SPLIT: "."
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      ##########################################################
+      ###
+      ### XXX: Pre-init steps here
+      ###
+      ##########################################################
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Generate timestamp
+        id: timestamp # output: value
+        run: |
+          TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
+          echo "Timestamp: ${TIMESTAMP}"
+          echo "::set-output name=value::${TIMESTAMP}"
+      - name: Get tag
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        id: tag # output: tag
+        uses: dawidd6/action-get-tag@v1
+      - name: Get Previous tag
+        id: previoustag # output: tag
+        uses: WyriHaximus/github-action-get-previous-tag@v1
+        with:
+          fallback: "notfound" # Optional fallback tag to use when no tag can be found
+      
+      ### XXX: Keep alive cron-type workflows
+      - uses: gautamkrishnar/keepalive-workflow@master
+
+      ##########################################################
+      ###
+      ### XXX: Env-setup steps here
+      ###
+      ##########################################################
+
+
+      ##########################################################
+      ###
+      ### XXX: Pre-build steps here (checking, debugging)
+      ###
+      ##########################################################
+        
+      # Enable tmate debugging of manually-triggered workflows if the input option was provided
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug_enabled }}
+        env:
+          SECRETS_CONTEXT: ${{ toJson(secrets) }}
+      
+
+      ##########################################################
+      ###
+      ### XXX: Main building steps here
+      ###
+      ##########################################################
+      
+      - name: Retrive nightly info and artifact
+        id: download
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p ori_artifacts; cd ori_artifacts
+
+          call() { set -x; "$@"; { ret=$?; set +x; } 2>/dev/null; return $ret; }
+          
+          export downloadSucc=1
+          export versionText="nightly"
+          getShaAndDown() {
+            succBuild=$(call gh run list -R $1 -L 5 --jq 'map( select( .conclusion == "success" and .headBranch == "master" and .name == "build" ) ) | .[0]' --json conclusion,name,event,headBranch,headSha,databaseId)
+            
+            sha=$(echo $succBuild | jq -r '"\(.headSha[0:8])"')
+            dbid=$(echo $succBuild | jq -r '"\(.databaseId)"')
+            
+            if ! (call gh run download -R $1 $dbid); then
+              export downloadSucc=0
+              echo Failed to download artifact for $1
+            fi
+            
+            export LAST_SHA=$sha
+            export LAST_DBID=$dbid
+            export versionText=${versionText}-${LAST_DBID}_${LAST_SHA}
+          }
+          
+          getShaAndDown libimobiledevice/libimobiledevice
+          getShaAndDown libimobiledevice/libusbmuxd
+          getShaAndDown libimobiledevice/idevicerestore
+          getShaAndDown libimobiledevice/libimobiledevice-glue
+          getShaAndDown libimobiledevice/libplist
+          getShaAndDown libimobiledevice/ideviceinstaller
+          getShaAndDown libimobiledevice/libideviceactivation
+          getShaAndDown libimobiledevice/usbmuxd
+          getShaAndDown libimobiledevice/libirecovery
+          
+          versionHashed=$(echo -n ${versionText} | md5sum)
+          versionHashed=${versionHashed:0:8}
+          echo "Version Text: $versionText"
+          echo "Version Hash: $versionHashed"
+          echo "Download Succeeded: $downloadSucc"
+          echo "::set-output name=versionText::${versionText}"
+          echo "::set-output name=versionHashed::${versionHashed}"
+          echo "::set-output name=downloadSucc::${downloadSucc}"
+
+      - name: Check if Version Updated
+        id: check
+        run: |
+          if [[ "${{ steps.download.outputs.downloadSucc }}" != "1" ]]; then
+            echo "Get Version successful, but artifact downloading failed, abort but not trigger failure"
+            echo "::set-output name=value::0"
+          else
+            new_ver=${{ steps.download.outputs.versionHashed }}
+            old_ver=${{ steps.previoustag.outputs.tag }}
+            old_ver=${old_ver##*${{ env.VERSION_SPLIT }}}
+            echo "Ori ver: $old_ver"
+            echo "New ver: $new_ver"
+            if [[ "$new_ver" != "$old_ver" ]]; then
+              echo "Version changed, need update!"
+              echo "::set-output name=value::1"
+            else
+              echo "Version unchanged, finishing..."
+              echo "::set-output name=value::0"
+            fi
+          fi
+        
+      - name: Build nightly package
+        if: ${{ steps.check.outputs.value == 1 }}
+        run: |
+          set -e -x
+          mkdir -p arch_artifacts arch_extracted arch_bundle
+          ( cd arch_artifacts; mkdir -p i686-mingw32 x86_64-mingw64 macOS x86_64-linux-gnu )
+          ( cd arch_extracted; mkdir -p i686-mingw32 x86_64-mingw64 macOS x86_64-linux-gnu )
+
+          do_tar() {
+            output=$1
+            sourcedir=$2
+            _output=$(realpath $output); (cd $sourcedir; shopt -s nullglob dotglob; tar cvf $_output *)
+          }
+          do_tar arch_bundle/_original_artifacts.tar ori_artifacts
+
+          processArch() {
+            arch=$1
+            cp -r ori_artifacts/*-latest_$arch arch_artifacts/$arch
+            (cd arch_artifacts/$arch; find . -type f -name "*.tar" -exec mv {} . \;)
+            find $(realpath "arch_artifacts/$arch") -type f -name "*.tar" -exec bash -c "cd arch_extracted/$arch; tar xvf {}" \;
+            do_tar arch_bundle/$arch.tar arch_extracted/$arch
+          }
+          processArch i686-mingw32
+          processArch x86_64-mingw64
+          processArch macOS
+          processArch x86_64-linux-gnu
+
+      ##########################################################
+      ###
+      ### XXX: Artifact Upload
+      ###
+      ##########################################################
+      
+      # Upload action artifact as-is
+      - name: Upload to GitHub Actions artifact
+        if: ${{ steps.check.outputs.value == 1 }}
+        uses: NyaMisty/upload-artifact-as-is@master
+        with:
+          path: arch_bundle/*
+      
+      # Release to Github, WITHOUT TAG
+      - name: Create New Release and Upload
+        if: ${{ steps.check.outputs.value == 1 }}
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "arch_bundle/*"
+          name: "${{ format('NightlyBuild-{0}-{1}', steps.timestamp.outputs.value, steps.download.outputs.versionHashed) }}"
+          tag: "${{ steps.timestamp.outputs.value }}${{ env.VERSION_SPLIT }}${{ steps.download.outputs.versionHashed }}"
+          commit: ${{ github.sha }}
+          body: "versionText: ${{ steps.download.outputs.versionText }}\nversionHashed: ${{ steps.download.outputs.versionHashed }}"
+          #prerelease: true
+          allowUpdates: true
+          removeArtifacts: true
+          replacesArtifacts: false
+          artifactErrorsFailBuild: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
