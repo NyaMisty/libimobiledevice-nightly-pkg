@@ -54,7 +54,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
       ### XXX: Keep alive cron-type workflows
-      - uses: gautamkrishnar/keepalive-workflow@master
+      - uses: NyaMisty/keepalive-workflow@v2
 
       ##########################################################
       ###
